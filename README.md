@@ -115,7 +115,9 @@ Cada entrada es un CSV de 20 campos:
 A,B,TL1,X,Y,TR1,TL1,TR1,TL2,TR2,SELECT,START,0,0,0,0,0,1,0,1
 ```
 
-Los primeros 6 son las filas del menu; los 6 siguientes, el destino default.
+Los primeros 6 son botones fisicos; los 6 siguientes, destinos por defecto.
+OJO: NO esta confirmado que las 6 filas del menu correspondan a esos 6
+botones en ese orden. Esa correspondencia se dedujo, no se verifico.
 
 ### Verificacion importante
 
