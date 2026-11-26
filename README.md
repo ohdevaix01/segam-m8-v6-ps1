@@ -74,6 +74,54 @@ jugador 1; los otros tres jugadores quedan como estaban.
 
 Editar con HxD (Windows) o ghex/bless (Linux). Nunca cambiar el tamano.
 
+
+## Desensamblado de rkgame (MIPS32, tabla de simbolos presente)
+
+Herramientas: `capstone` (MIPS32 LE). Base de codigo 0x400000, gp de cada
+funcion = `0x110000 + 0x3fe0 + addr` para las de InitKeyMapping.
+
+| Direccion | Simbolo | Funcion |
+|---|---|---|
+| 0x41c260 | InitKeyMapping0fEmuType | elige tabla default segun tipo de core |
+| 0x4eb0c4 | (dato) | tabla default PS: 0a 0b 09 08 00 01 x4 jugadores |
+| 0x41c784 | SaveKeyMappingConfigFile | escribe el .scf |
+| 0x41f008 | GetJoystickConfig | lee joystick.cpd por VID_PID |
+| 0x41f2ec | JoystickTest | test interno de ejes/botones |
+| 0x4eae80 | (dato) | tabla de etiquetas del menu |
+
+### Tabla de etiquetas (0x4eae80)
+
+Contiene nombres de EJE y de BOTON mezclados:
+
+```
+G12 G13 G14 G15 B C UP A Z Y 5 7 8 10 13 15 16 ... 29 P2 P3 P4
+```
+
+`Z` e `Y` son nombres de eje SDL, no botones. El menu los muestra tal cual
+al capturar, o sea que si distingue y captura correctamente.
+
+### Formato de joystick.cpd
+
+ZIP ofuscado. Nombres de entrada = `VID_PID[_VER]` en hex:
+
+```
+0810_0001_0100  -> mando del Segam M8 V6 (VID 0x0810, PID 0x0001)
+```
+
+Cada entrada es un CSV de 20 campos:
+
+```
+<6 botones fisicos>, <6 botones destino>, <resto: indices>
+A,B,TL1,X,Y,TR1,TL1,TR1,TL2,TR2,SELECT,START,0,0,0,0,0,1,0,1
+```
+
+Los primeros 6 son las filas del menu; los 6 siguientes, el destino default.
+
+### Verificacion importante
+
+El `.scf` del firmware es **identico** a la tabla default PS embebida en el
+binario (0x4eb0c4). Nadie lo modifico: es el default de fabrica.
+
 ## Pendiente
 
 Confirmar el orden real de slots: cambiar UN boton desde el menu del
