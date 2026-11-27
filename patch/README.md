@@ -1,95 +1,101 @@
-# rkgame con swap de joystick en "Factory Setting"
+# rkgame: Factory Setting cambia el perfil de joystick
 
-Version parcheada de `rkgame` que convierte la opcion **Settings > Factory Setting**
-en un intercambio de perfiles de botones, sin tocar nada mas.
-
-## Que hace
-
-Cuando entras a `Settings > Factory Setting`, elegi **Yes** y el programa
-intercambia los dos archivos de mapeo:
+Version parcheada de `rkgame` donde **Settings > Factory Setting > Yes**
+intercambia los dos perfiles de botones y **no borra nada**.
 
 ```
-joystick.cpd    ->  joystick.tmp
-joystickbk.cpd  ->  joystick.cpd
-joystick.tmp    ->  joystickbk.cpd
+joystick.cpd    -> joystick.tmp
+joystickbk.cpd  -> joystick.cpd
+joystick.tmp    -> joystick.cpd
 ```
 
-Resultado: los dos archivos quedan invertidos. Cada vez que confirmas, cambia
-el perfil de botones.
+Cada confirmacion alterna entre un perfil y el otro. Confirmando dos veces
+volves al estado inicial.
 
-Si `joystick.cpd` no existe todavia (primer arranque), copia `joystickbk.cpd`
-como `joystick.cpd`. Eso sirve de "restaurar perfil".
+## El error de la version anterior
 
-El reset de settings de fabrica **ya no se ejecuta**. Esa opcion pasa a ser
-"cambiar perfil de botones".
+La version previa hookeaba `0x41A804`. Ese offset esta dentro de la funcion
+`0x4183A0`, que es el parser de configuracion y textos de la UI (carga
+`Config_Setting%d`, `Setting_RecoverInfo1/2`, `Game_JoystickTab%d`, etc).
+
+No tiene nada que ver con el reset. Por eso el parche no hacia nada y el
+reset original seguia corriendo: el idioma volvia a ingles y se borraba el
+history.
+
+## Donde esta el reset de verdad
+
+Funcion `0x4206A8`. Es la que toca los tres archivos:
+
+```
+0x4eac38  setting.raw
+0x4ea2d0  %s/setting.xml
+0x4ea2f8  config
+0x4ea300  language
+0x4eab54  %s/recent.lst
+0x4ea120  %s/favorites.lst
+```
+
+El punto del "Yes" es `0x4210E0`:
+
+```
+0x4210E0  addiu $v0, $zero, 1
+0x4210E4  bne   $s7, $v0, 0x420DB4     ; s7 != 1 -> cancela
+0x4210E8  addiu $v0, $zero, -1          ; delay slot
+0x4210EC  lw    $v1, 0xa4($sp)          ; <- arranca el reset
+```
+
+Se reemplazan las dos primeras instrucciones por `j 0x512A94`.
+
+## Casos borde (verificados por emulacion)
+
+| Situacion | Que hace |
+|---|---|
+| Existen los dos | Hace el swap |
+| No existe `joystick.cpd` | Copia `joystickbk.cpd` -> `joystick.cpd` |
+| No existe `joystickbk.cpd` | No toca nada, vuelve al menu |
+| No existe ninguno | No toca nada |
+| El usuario cancela | No toca nada, vuelve al menu |
+
+En ningun caso se toca `setting.xml`, `recent.lst` ni `favorites.lst`.
 
 ## Instalacion
 
-1. Backup del original (por si acaso):
+1. Backup del original:
 
    ```
    /mnt/sdcard/cubegm/rkgame  ->  rkgame.orig
    ```
 
 2. Copiar el `rkgame` de esta carpeta a `/mnt/sdcard/cubegm/rkgame`.
-3. Asegurarse de que exista `/mnt/sdcard/cubegm/joystickbk.cpd`.
-4. Arrancar el equipo.
-
-Si algo sale mal, se restaura `rkgame.orig` desde la PC.
-
-## Uso
-
-- Entrar a `Settings > Factory Setting > Yes` = cambiar perfil.
-- El cambio se toma al instante: `GetJoystickConfig` abre y parsea
-  `joystick.cpd` en cada llamada, no lo cachea.
+3. Tener `/mnt/sdcard/cubegm/joystickbk.cpd` (viene en el firmware).
+4. Reiniciar.
 
 ## Como esta hecho
 
-Tres modificaciones, nada mas:
-
-| Offset | Que | Detalle |
-|---|---|---|
-| `0x1A804` | hook | `j 0x512970` (4 instrucciones originales reemplazadas) |
-| `0x112970` | codigo nuevo | rutina de copia en streaming, 1032 bytes |
-| `0x112F98` | strings | rutas y modos de apertura |
-| PHDR `LOAD1` | `filesz`/`memsz` | `0x112970` -> `0x113000` para mapear la cola |
-
-El codigo nuevo vive en los 1680 bytes de ceros que hay entre el fin de `.plt`
-y el siguiente segmento. Se verifico que esa zona esta toda en cero en el
-original y que no hay solape: `LOAD1` termina en `0x513000` y `LOAD2` arranca
-en `0x523000`.
-
-### Por que el hook es seguro
-
-`0x41A804` es el destino de un unico `beq` (`0x41958C`), que es la rama "Yes"
-del dialogo de Factory Setting. Se verifico que ninguna otra rama del binario
-cae en ese bloque ni salta al medio de el.
-
-El bloque original copiaba 45 bytes de settings por defecto de `.rodata` a
-`.data` y despues hacia `b 0x419960`. El parche saltea esa copia y retoma
-exactamente en `0x419960`, asi que el resto de la pantalla sigue funcionando
-igual.
-
-### Por que no usa rename
-
-`rkgame` no importa `rename` ni `unlink` (se verificaron los 557 simbolos
-dinamicos). Lo unico parecido es `shm_unlink`, que es memoria compartida.
-
-Pero si tiene `fopen`, `fread`, `fwrite`, `fclose`, `malloc` y `free`. Copiar
-en streaming hace el mismo efecto que renombrar, sin agregar simbolos nuevos
-ni tocar la tabla de imports.
-
-Se usan los stubs de `.plt` (no los de `.MIPS.stubs`) porque los primeros
-calculan la GOT con `lui`/`lw` sobre `$t7` y no dependen de `$gp`.
-
-| Funcion | Stub |
+| Offset | Que |
 |---|---|
-| `fopen` | `0x5124A0` |
-| `fread` | `0x512420` |
-| `fwrite` | `0x512530` |
-| `fclose` | `0x512630` |
-| `malloc` | `0x512550` |
-| `free` | `0x512760` |
+| `0x4210E0` | hook: `j 0x512A94` (2 instrucciones reemplazadas) |
+| `0x512970` | subrutina `copysub` (292 bytes) |
+| `0x512A94` | cuerpo principal (508 bytes) |
+| `0x512FC8` | strings: rutas y modos |
+| PHDR `LOAD1` | `filesz`/`memsz` `0x112970` -> `0x113000` |
+
+`rkgame` no importa `rename` ni `unlink`, pero si `fopen`, `fread`, `fwrite`,
+`fclose`, `malloc` y `free`. El swap se hace copiando en streaming.
+
+### Orden de copia
+
+`bk -> tmp`, `cpd -> bk`, `tmp -> cpd`, y al final `cpd -> tmp`. Asi el `.cpd`
+activo se escribe ultimo y un corte a mitad no lo deja truncado.
+
+### Trampas de keystone que hubo que esquivar
+
+| Trampa | Sintoma | Solucion |
+|---|---|---|
+| `jal` a label local | se ensambla como `lw $t9,($gp)` | ensamblar la subrutina primero y usar `jal <direccion>` |
+| delay slot con instruccion util | `fclose` con `$a0` viejo | siempre `nop` en el delay slot |
+| `$s0` pisado | el menu pierde el puntero al objeto | guardar el `$s0` original en un slot del frame |
+| `sprintf` vs `snprintf` | firma distinta, crash | `0x5128C0` es `snprintf(buf, size, fmt, ...)` |
 
 ## Regenerar el binario
 
@@ -98,28 +104,22 @@ pip install keystone-engine capstone
 python3 mk_rkgame_factoryswap.py rkgame_original rkgame
 ```
 
-El script escribe el hook, el codigo, las strings y ajusta el PHDR. Es
-deterministico: con el mismo `rkgame` original da el mismo resultado.
+Es deterministico. El generador valida solo: que los delay slots tengan `nop`,
+que los saltos queden dentro del cave, y que cada `jal` apunte a un stub
+conocido.
 
 ## Verificacion
 
-El diff contra el original toca solo tres zonas: el hook (`0x1A804`), la cola
-del segmento (`0x112970..0x113000`) y los bytes `filesz`/`memsz` del PHDR.
-`.plt`, `.got`, `.dynamic` y el resto de `.text` quedan intactos.
+Emulado con Unicorn contra un filesystem simulado, con tamanos reales de
+322 KB:
 
-```
-$ python3 -c "..."
-diff fuera de hook/cueva/phdr: NINGUNO - limpio
-```
+- swap completo, byte a byte
+- primer uso (sin `joystick.cpd`)
+- sin `joystickbk.cpd`
+- sin ninguno de los dos
+- cancelar
+- dos swaps seguidos vuelven al original
 
-## Pendiente de probar en el equipo
+## Pendiente
 
-- Que el stick arranque con el binario parcheado.
-- Que el swap se refleje sin reiniciar (muy probable, `GetJoystickConfig`
-  abre el archivo en cada llamada, pero no se pudo ejecutar en el hardware).
-- Que los dos perfiles se distingan bien en la practica.
-
-## Aviso
-
-Esto modifica el binario principal del equipo. Si el parche fallara, el stick
-no arranca. Por eso el paso 1 es el backup.
+- Probar en el equipo.
