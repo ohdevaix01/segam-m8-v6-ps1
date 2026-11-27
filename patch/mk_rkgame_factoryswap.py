@@ -1,10 +1,20 @@
 #!/usr/bin/env python3
-"""rkgame v3: Factory Setting cambia el perfil de joystick.
+"""rkgame v4: Factory Setting cambia el perfil de joystick y reinicia.
 
-Cambios respecto de v2:
-  - usa rutas absolutas (/mnt/sdcard/cubegm/...) en vez de la workpath
-  - deja dbg.txt con lo que paso, para diagnosticar desde la SD
-  - si algo falla no toca nada y vuelve al menu igual
+El swap de archivos solo no alcanza: rkgame lee joystick.cpd al arrancar,
+asi que el cambio no se ve hasta reiniciar. icube es un supervisor: cuando
+el hijo (rkgame) termina, lo relanza con execl. Entonces el cave hace el
+swap y llama exit(0); icube lo levanta de nuevo y ya toma el perfil nuevo.
+
+Hook en 0x4210E0, el "Yes" real del dialogo:
+
+    0x4210E0  addiu $v0, $zero, 1
+    0x4210E4  bne   $s7, $v0, 0x420DB4   ; s7 != 1 -> cancela
+    0x4210E8  addiu $v0, $zero, -1        ; delay slot
+    0x4210EC  lw    $v1, 0xa4($sp)        ; <- reset destructivo
+
+Si el usuario cancela se vuelve a 0x420DB4 con v0 = -1, igual que el
+original. Si confirma, se hace el swap, se anota en dbg.txt y se sale.
 """
 from keystone import *
 from capstone import *
@@ -13,29 +23,28 @@ import sys
 
 SRC, OUT = sys.argv[1], sys.argv[2]
 CAVE, CAVE_END = 0x512970, 0x513000
-HOOK, RET_MENU = 0x4210E0, 0x420784
+HOOK, RET_NO = 0x4210E0, 0x420DB4
 FOPEN, FREAD, FWRITE, FCLOSE = 0x5124A0, 0x512420, 0x512530, 0x512630
-MALLOC, FREE = 0x512550, 0x512760
+MALLOC, FREE, EXIT = 0x512550, 0x512760, 0x512810
+SDL_QUIT = 0x512430
 
 S_CPD = b"/mnt/sdcard/cubegm/joystick.cpd\x00"
 S_BK = b"/mnt/sdcard/cubegm/joystickbk.cpd\x00"
 S_TMP = b"/mnt/sdcard/cubegm/joystick.tmp\x00"
 S_RB = b"rb\x00"
 S_WB = b"wb\x00"
-S_TAG = b"hook: "
-S_SWAP = b"swap\n\x00"
+S_SWAP = b"swap + restart\n\x00"
+S_INIT = b"init + restart\n\x00"
 S_FAIL = b"no-swap\n\x00"
-S_NULL = b"wp=NULL\n\x00"
-S_NL = b"\n\x00"
-S_INIT = b"init\n\x00"
+S_CANCEL = b"cancel\n\x00"
 L1 = b"/mnt/sdcard/cubegm/dbg.txt\x00"
 L2 = b"/mnt/sdcard/dbg.txt\x00"
 L3 = b"/tmp/dbg.txt\x00"
 
-BLOCKS = [S_CPD, S_BK, S_TMP, S_RB, S_WB, S_TAG, S_SWAP, S_FAIL, S_NULL,
-          S_NL, S_INIT, L1, L2, L3]
-NAMES = ['CPD', 'BK', 'TMP', 'RB', 'WB', 'TAG', 'SWAP', 'FAIL', 'NULL',
-         'NL', 'INIT', 'L1', 'L2', 'L3']
+BLOCKS = [S_CPD, S_BK, S_TMP, S_RB, S_WB, S_SWAP, S_INIT, S_FAIL, S_CANCEL,
+          L1, L2, L3]
+NAMES = ['CPD', 'BK', 'TMP', 'RB', 'WB', 'SWAP', 'INIT', 'FAIL', 'CANCEL',
+         'L1', 'L2', 'L3']
 STRINGS = b''.join(BLOCKS)
 STRV = CAVE_END - len(STRINGS)
 V = {}
@@ -202,11 +211,10 @@ wl = A(WLOG, A_CPY + len(cp))
 A_LOG = A_CPY + len(cp)
 A_MAIN = A_LOG + len(wl)
 
-# frame del main: buffer de log abajo, registros guardados arriba
 BUF = 0
-S_RA, S_GP = 700, 696
-S_S0, S_S1, S_S2, S_S3 = 692, 688, 684, 680
-FRAME = 712
+S_RA, S_GP = 300, 296
+S_S0, S_S1, S_S2, S_S3 = 292, 288, 284, 280
+FRAME = 312
 
 MAIN = """
     addiu $sp, $sp, -{FRAME}
@@ -217,10 +225,8 @@ MAIN = """
     sw $s2, {S_S2}($sp)
     sw $s3, {S_S3}($sp)
 
-    addiu $s3, $zero, 0
-
     addiu $v0, $zero, 1
-    bne $s7, $v0, m_log
+    bne $s7, $v0, m_cancel
     nop
 
     # bk -> tmp
@@ -228,10 +234,10 @@ MAIN = """
     {LA_TMP_D}
     jal {CPY}
     nop
-    beqz $v0, m_log
+    beqz $v0, m_fail
     nop
 
-    # cpd -> bk. Si no hay cpd es el primer uso: bk -> cpd y listo.
+    # cpd -> bk. Si no hay cpd es el primer uso.
     {LA_CPD_A}
     {LA_BK_D}
     jal {CPY}
@@ -244,15 +250,15 @@ MAIN = """
     {LA_CPD_D}
     jal {CPY}
     nop
-    beqz $v0, m_log
+    beqz $v0, m_fail
     nop
 
-    # cpd -> tmp
+    # cpd -> tmp, para que tmp quede igual al perfil nuevo
     {LA_CPD_A}
     {LA_TMP_D}
     jal {CPY}
     nop
-    addiu $s3, $zero, 1
+    {LA_SWAP}
     b m_log
     nop
 
@@ -261,67 +267,32 @@ m_first:
     {LA_CPD_D}
     jal {CPY}
     nop
-    beqz $v0, m_log
+    beqz $v0, m_fail
     nop
-    addiu $s3, $zero, 2
+    {LA_INIT}
+    b m_log
+    nop
+
+m_fail:
+    {LA_FAIL}
 
 m_log:
+    move $s3, $v0
     addiu $s0, $sp, {BUF}
-    move $s1, $s0
+    move $a0, $s0
+    move $a1, $s3
+    jal {APP}
+    nop
 
-    # "hook: " + workpath (o "wp=NULL") + resultado
-    move $a0, $s1
-    {LA_TAG}
-    jal {APP}
-    nop
-    move $s1, $v0
-
-    lw $s2, -0x7fa8($gp)
-    bnez $s2, m_wp
-    nop
-    move $a0, $s1
-    {LA_NULL}
-    jal {APP}
-    nop
-    b m_res
-    nop
-m_wp:
-    move $a0, $s1
-    move $a1, $s2
-    jal {APP}
-    nop
-    move $s1, $v0
-    move $a0, $s1
-    {LA_NL}
-    jal {APP}
-    nop
-m_res:
-    move $s1, $v0
-    move $a0, $s1
-    beqz $s3, m_none
-    nop
-    addiu $t0, $zero, 2
-    beq $s3, $t0, m_init
-    nop
-    {LA_SWAP}
-    jal {APP}
-    nop
-    b m_wr
-    nop
-m_init:
-    {LA_INIT}
-    jal {APP}
-    nop
-    b m_wr
-    nop
-m_none:
-    {LA_FAIL}
-    jal {APP}
+    addiu $s2, $zero, 0
+m_len:
+    addu $t0, $s0, $s2
+    lbu $t1, 0($t0)
+    beqz $t1, m_wr
+    addiu $s2, $s2, 1
+    b m_len
     nop
 m_wr:
-    move $s2, $v0
-    subu $s2, $s2, $s0
-
     {LA_L1}
     move $a1, $s0
     move $a2, $s2
@@ -338,6 +309,14 @@ m_wr:
     jal {LOG}
     nop
 
+    # salir limpio: icube relanza rkgame y ahi se relee joystick.cpd
+    jal {SDLQ}
+    nop
+    move $a0, $zero
+    jal {EXIT}
+    nop
+
+m_cancel:
     lw $t0, {S_S0}($sp)
     addiu $v0, $zero, -1
     sw $v0, 0x18($t0)
@@ -348,7 +327,7 @@ m_wr:
     lw $s2, {S_S2}($sp)
     lw $s3, {S_S3}($sp)
     addiu $sp, $sp, {FRAME}
-    {LA_RET}
+    {LA_RETNO}
     jr $t9
     nop
 """.format(FRAME=FRAME, S_RA=S_RA, S_GP=S_GP, S_S0=S_S0, S_S1=S_S1,
@@ -356,18 +335,17 @@ m_wr:
            LA_CPD_A=la('a0', V['CPD']), LA_BK_A=la('a0', V['BK']),
            LA_TMP_A=la('a0', V['TMP']), LA_CPD_D=la('a1', V['CPD']),
            LA_BK_D=la('a1', V['BK']), LA_TMP_D=la('a1', V['TMP']),
-           LA_TAG=la('a1', V['TAG']), LA_SWAP=la('a1', V['SWAP']),
-           LA_FAIL=la('a1', V['FAIL']), LA_NULL=la('a1', V['NULL']),
-           LA_NL=la('a1', V['NL']), LA_INIT=la('a1', V['INIT']),
+           LA_SWAP=la('v0', V['SWAP']), LA_INIT=la('v0', V['INIT']),
+           LA_FAIL=la('v0', V['FAIL']),
            LA_L1=la('a0', V['L1']), LA_L2=la('a0', V['L2']),
            LA_L3=la('a0', V['L3']),
-           LA_RET=la('t9', RET_MENU), APP=A_APP, CPY=A_CPY, LOG=A_LOG)
+           LA_RETNO=la('t9', RET_NO),
+           APP=A_APP, CPY=A_CPY, LOG=A_LOG, EXIT=EXIT, SDLQ=SDL_QUIT)
 
 mn = A(MAIN, A_MAIN)
 enc = ap + cp + wl + mn
 print("app %#x copy %#x log %#x main %#x end %#x strs %#x margen %d" %
-      (A_APP, A_CPY, A_LOG, A_MAIN, CAVE + len(enc), STRV,
-       STRV - (CAVE + len(enc))))
+      (A_APP, A_CPY, A_LOG, A_MAIN, CAVE + len(enc), STRV, STRV - (CAVE + len(enc))))
 assert CAVE + len(enc) <= STRV, "solape"
 
 ins = list(MD.disasm(enc, CAVE))
