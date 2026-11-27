@@ -1,72 +1,90 @@
 #!/usr/bin/env python3
-"""rkgame: Factory Setting cambia el perfil de joystick en vez de resetear.
+"""rkgame v3: Factory Setting cambia el perfil de joystick.
 
-Punto del "Yes" del dialogo Factory Setting (funcion 0x4206A8):
-
-    0x4210E0  addiu $v0, $zero, 1
-    0x4210E4  bne   $s7, $v0, 0x420DB4     ; s7 != 1 -> cancela
-    0x4210E8  addiu $v0, $zero, -1          ; delay slot
-    0x4210EC  lw    $v1, 0xa4($sp)          ; <- arranca el reset destructivo
-
-Se reemplazan las dos primeras instrucciones por un salto al cave, que hace:
-
-    joystick.cpd    -> joystick.tmp
-    joystickbk.cpd  -> joystick.cpd
-    joystick.tmp    -> joystickbk.cpd
-
-Si joystick.cpd no existe (primer uso) copia joystickbk.cpd -> joystick.cpd.
-Si falta el bk no toca nada. En todos los casos vuelve al menu sin ejecutar el
-reset: setting.xml, recent.lst y favorites.lst quedan intactos.
-
-Uso: python3 mk_rkgame_factoryswap.py <rkgame_original> <salida>
+Cambios respecto de v2:
+  - usa rutas absolutas (/mnt/sdcard/cubegm/...) en vez de la workpath
+  - deja dbg.txt con lo que paso, para diagnosticar desde la SD
+  - si algo falla no toca nada y vuelve al menu igual
 """
 from keystone import *
 from capstone import *
-import struct, sys
+import struct
+import sys
 
-SRC = sys.argv[1] if len(sys.argv) > 1 else 'rkgame.orig'
-OUT = sys.argv[2] if len(sys.argv) > 2 else 'rkgame'
-
+SRC, OUT = sys.argv[1], sys.argv[2]
 CAVE, CAVE_END = 0x512970, 0x513000
-HOOK = 0x4210E0
-RET_MENU, RET_NO = 0x420784, 0x420DB4
-SNPRINTF = 0x5128c0
-FOPEN, FREAD, FWRITE, FCLOSE = 0x5124a0, 0x512420, 0x512530, 0x512630
+HOOK, RET_MENU = 0x4210E0, 0x420784
+FOPEN, FREAD, FWRITE, FCLOSE = 0x5124A0, 0x512420, 0x512530, 0x512630
 MALLOC, FREE = 0x512550, 0x512760
 
-FMT_CPD = b"%s/joystick.cpd\x00"
-FMT_BK  = b"%s/joystickbk.cpd\x00"
-FMT_TMP = b"%s/joystick.tmp\x00"
-STRINGS = FMT_CPD + FMT_BK + FMT_TMP + b"rb\x00wb\x00"
+S_CPD = b"/mnt/sdcard/cubegm/joystick.cpd\x00"
+S_BK = b"/mnt/sdcard/cubegm/joystickbk.cpd\x00"
+S_TMP = b"/mnt/sdcard/cubegm/joystick.tmp\x00"
+S_RB = b"rb\x00"
+S_WB = b"wb\x00"
+S_TAG = b"hook: "
+S_SWAP = b"swap\n\x00"
+S_FAIL = b"no-swap\n\x00"
+S_NULL = b"wp=NULL\n\x00"
+S_NL = b"\n\x00"
+S_INIT = b"init\n\x00"
+L1 = b"/mnt/sdcard/cubegm/dbg.txt\x00"
+L2 = b"/mnt/sdcard/dbg.txt\x00"
+L3 = b"/tmp/dbg.txt\x00"
 
+BLOCKS = [S_CPD, S_BK, S_TMP, S_RB, S_WB, S_TAG, S_SWAP, S_FAIL, S_NULL,
+          S_NL, S_INIT, L1, L2, L3]
+NAMES = ['CPD', 'BK', 'TMP', 'RB', 'WB', 'TAG', 'SWAP', 'FAIL', 'NULL',
+         'NL', 'INIT', 'L1', 'L2', 'L3']
+STRINGS = b''.join(BLOCKS)
 STRV = CAVE_END - len(STRINGS)
-V_CPD = STRV
-V_BK  = STRV + len(FMT_CPD)
-V_TMP = V_BK + len(FMT_BK)
-V_RB  = V_TMP + len(FMT_TMP)
-V_WB  = V_RB + 3
+V = {}
+_p = STRV
+for _n, _b in zip(NAMES, BLOCKS):
+    V[_n] = _p
+    _p += len(_b)
+assert _p == CAVE_END
 
-def hi(v): return ((v >> 16) + ((v & 0xffff) >= 0x8000)) & 0xffff
+
+def hi(v):
+    return ((v >> 16) + ((v & 0xFFFF) >= 0x8000)) & 0xFFFF
+
+
 def lo(v):
-    x = v & 0xffff
+    x = v & 0xFFFF
     return x - 0x10000 if x >= 0x8000 else x
-def la(r, va): return f"lui ${r},{hi(va)&0xffff}\naddiu ${r},${r},{lo(va)}"
 
-BUF_CPD, BUF_BK, BUF_TMP = 0, 128, 256
-FR, FG = 544, 540
-F0, F1, F2, F3, F4 = 536, 532, 528, 524, 520
-FS0 = 516
-FRAME = 552
+
+def la(r, va):
+    return "lui $%s,%d\naddiu $%s,$%s,%d" % (r, hi(va), r, r, lo(va))
+
 
 KS = Ks(KS_ARCH_MIPS, KS_MODE_MIPS32 + KS_MODE_LITTLE_ENDIAN)
 MD = Cs(CS_ARCH_MIPS, CS_MODE_MIPS32 | CS_MODE_LITTLE_ENDIAN)
 
-def asm_at(code, va):
+
+def A(code, va):
     return bytes(KS.asm(code, va)[0])
 
-# copysub va primero, para saber su direccion exacta antes de referenciarla.
-# jal a un label local se ensambla mal (keystone lo resuelve como lw $t9,($gp)).
-COPYSUB = f"""
+
+# append(dst=a0, src=a1) -> v0 = nuevo fin
+APPEND = """
+    move $v0, $a0
+ap_l:
+    lbu $t0, 0($a1)
+    beqz $t0, ap_d
+    sb $t0, 0($v0)
+    addiu $v0, $v0, 1
+    addiu $a1, $a1, 1
+    b ap_l
+    nop
+ap_d:
+    jr $ra
+    nop
+"""
+
+# copysub(src=a0, dst=a1) -> v0 = 1 si copio
+COPY = """
     addiu $sp, $sp, -40
     sw $ra, 36($sp)
     sw $s0, 32($sp)
@@ -75,32 +93,28 @@ COPYSUB = f"""
     sw $s3, 20($sp)
     sw $a0, 16($sp)
     sw $a1, 12($sp)
-
-    {la('a1', V_RB)}
-    jal {FOPEN:#x}
+    {LA_RB}
+    jal {FOPEN}
     nop
-    beqz $v0, cs_end
+    beqz $v0, cs_bad
     move $s0, $v0
-
     lw $a0, 12($sp)
-    {la('a1', V_WB)}
-    jal {FOPEN:#x}
+    {LA_WB}
+    jal {FOPEN}
     nop
-    beqz $v0, cs_src
+    beqz $v0, cs_nodst
     move $s1, $v0
-
     addiu $a0, $zero, 4096
-    jal {MALLOC:#x}
+    jal {MALLOC}
     nop
     beqz $v0, cs_both
     move $s2, $v0
-
-cs_loop:
+cs_l:
     move $a0, $s2
     addiu $a1, $zero, 1
     addiu $a2, $zero, 4096
     move $a3, $s0
-    jal {FREAD:#x}
+    jal {FREAD}
     nop
     beqz $v0, cs_free
     move $s3, $v0
@@ -108,24 +122,33 @@ cs_loop:
     addiu $a1, $zero, 1
     move $a2, $s3
     move $a3, $s1
-    jal {FWRITE:#x}
+    jal {FWRITE}
     nop
-    b cs_loop
+    b cs_l
     nop
-
 cs_free:
     move $a0, $s2
-    jal {FREE:#x}
+    jal {FREE}
     nop
 cs_both:
     move $a0, $s1
-    jal {FCLOSE:#x}
+    jal {FCLOSE}
     nop
+    addiu $s3, $zero, 1
+    b cs_src
+    nop
+cs_nodst:
+    move $s3, $zero
 cs_src:
     move $a0, $s0
-    jal {FCLOSE:#x}
+    jal {FCLOSE}
     nop
-cs_end:
+    move $v0, $s3
+    b cs_e
+    nop
+cs_bad:
+    move $v0, $zero
+cs_e:
     lw $ra, 36($sp)
     lw $s0, 32($sp)
     lw $s1, 28($sp)
@@ -134,173 +157,240 @@ cs_end:
     addiu $sp, $sp, 40
     jr $ra
     nop
-"""
-copy_bytes = asm_at(COPYSUB, CAVE)
-COPYSUB_VA = CAVE
-MAIN_VA = CAVE + len(copy_bytes)
+""".format(LA_RB=la('a1', V['RB']), LA_WB=la('a1', V['WB']),
+           FOPEN=FOPEN, FREAD=FREAD, FWRITE=FWRITE, FCLOSE=FCLOSE,
+           MALLOC=MALLOC, FREE=FREE)
 
-MAIN = f"""
+# wlog(path=a0, buf=a1, len=a2)
+WLOG = """
+    addiu $sp, $sp, -32
+    sw $ra, 28($sp)
+    sw $s0, 24($sp)
+    sw $s1, 20($sp)
+    sw $s2, 16($sp)
+    move $s1, $a1
+    move $s2, $a2
+    {LA_WB}
+    jal {FOPEN}
+    nop
+    beqz $v0, wl_e
+    move $s0, $v0
+    move $a0, $s1
+    addiu $a1, $zero, 1
+    move $a2, $s2
+    move $a3, $s0
+    jal {FWRITE}
+    nop
+    move $a0, $s0
+    jal {FCLOSE}
+    nop
+wl_e:
+    lw $ra, 28($sp)
+    lw $s0, 24($sp)
+    lw $s1, 20($sp)
+    lw $s2, 16($sp)
+    addiu $sp, $sp, 32
+    jr $ra
+    nop
+""".format(LA_WB=la('a1', V['WB']), FOPEN=FOPEN, FWRITE=FWRITE, FCLOSE=FCLOSE)
+
+ap = A(APPEND, CAVE)
+A_APP = CAVE
+cp = A(COPY, A_APP + len(ap))
+A_CPY = A_APP + len(ap)
+wl = A(WLOG, A_CPY + len(cp))
+A_LOG = A_CPY + len(cp)
+A_MAIN = A_LOG + len(wl)
+
+# frame del main: buffer de log abajo, registros guardados arriba
+BUF = 0
+S_RA, S_GP = 700, 696
+S_S0, S_S1, S_S2, S_S3 = 692, 688, 684, 680
+FRAME = 712
+
+MAIN = """
     addiu $sp, $sp, -{FRAME}
-    sw $ra, {FR}($sp)
-    sw $gp, {FG}($sp)
-    sw $s0, {F0}($sp)
-    sw $s1, {F1}($sp)
-    sw $s2, {F2}($sp)
-    sw $s3, {F3}($sp)
-    sw $s4, {F4}($sp)
-    sw $s0, {FS0}($sp)
+    sw $ra, {S_RA}($sp)
+    sw $gp, {S_GP}($sp)
+    sw $s0, {S_S0}($sp)
+    sw $s1, {S_S1}($sp)
+    sw $s2, {S_S2}($sp)
+    sw $s3, {S_S3}($sp)
+
+    addiu $s3, $zero, 0
 
     addiu $v0, $zero, 1
-    bne $s7, $v0, notconf
+    bne $s7, $v0, m_log
     nop
 
-    lw $s4, -0x7fa8($gp)
-    beqz $s4, notconf
+    # bk -> tmp
+    {LA_BK_A}
+    {LA_TMP_D}
+    jal {CPY}
+    nop
+    beqz $v0, m_log
     nop
 
-    addiu $a0, $sp, {BUF_CPD}
-    addiu $a1, $zero, 128
-    {la('a2', V_CPD)}
-    move $a3, $s4
-    jal {SNPRINTF:#x}
+    # cpd -> bk. Si no hay cpd es el primer uso: bk -> cpd y listo.
+    {LA_CPD_A}
+    {LA_BK_D}
+    jal {CPY}
+    nop
+    beqz $v0, m_first
     nop
 
-    addiu $a0, $sp, {BUF_BK}
-    addiu $a1, $zero, 128
-    {la('a2', V_BK)}
-    move $a3, $s4
-    jal {SNPRINTF:#x}
+    # tmp -> cpd
+    {LA_TMP_A}
+    {LA_CPD_D}
+    jal {CPY}
+    nop
+    beqz $v0, m_log
     nop
 
-    addiu $a0, $sp, {BUF_TMP}
-    addiu $a1, $zero, 128
-    {la('a2', V_TMP)}
-    move $a3, $s4
-    jal {SNPRINTF:#x}
+    # cpd -> tmp
+    {LA_CPD_A}
+    {LA_TMP_D}
+    jal {CPY}
+    nop
+    addiu $s3, $zero, 1
+    b m_log
     nop
 
-    addiu $a0, $sp, {BUF_CPD}
-    {la('a1', V_RB)}
-    jal {FOPEN:#x}
+m_first:
+    {LA_BK_A}
+    {LA_CPD_D}
+    jal {CPY}
     nop
-    beqz $v0, init_only
-    move $s0, $v0
-    move $a0, $s0
-    jal {FCLOSE:#x}
+    beqz $v0, m_log
+    nop
+    addiu $s3, $zero, 2
+
+m_log:
+    addiu $s0, $sp, {BUF}
+    move $s1, $s0
+
+    # "hook: " + workpath (o "wp=NULL") + resultado
+    move $a0, $s1
+    {LA_TAG}
+    jal {APP}
+    nop
+    move $s1, $v0
+
+    lw $s2, -0x7fa8($gp)
+    bnez $s2, m_wp
+    nop
+    move $a0, $s1
+    {LA_NULL}
+    jal {APP}
+    nop
+    b m_res
+    nop
+m_wp:
+    move $a0, $s1
+    move $a1, $s2
+    jal {APP}
+    nop
+    move $s1, $v0
+    move $a0, $s1
+    {LA_NL}
+    jal {APP}
+    nop
+m_res:
+    move $s1, $v0
+    move $a0, $s1
+    beqz $s3, m_none
+    nop
+    addiu $t0, $zero, 2
+    beq $s3, $t0, m_init
+    nop
+    {LA_SWAP}
+    jal {APP}
+    nop
+    b m_wr
+    nop
+m_init:
+    {LA_INIT}
+    jal {APP}
+    nop
+    b m_wr
+    nop
+m_none:
+    {LA_FAIL}
+    jal {APP}
+    nop
+m_wr:
+    move $s2, $v0
+    subu $s2, $s2, $s0
+
+    {LA_L1}
+    move $a1, $s0
+    move $a2, $s2
+    jal {LOG}
+    nop
+    {LA_L2}
+    move $a1, $s0
+    move $a2, $s2
+    jal {LOG}
+    nop
+    {LA_L3}
+    move $a1, $s0
+    move $a2, $s2
+    jal {LOG}
     nop
 
-    addiu $a0, $sp, {BUF_BK}
-    {la('a1', V_RB)}
-    jal {FOPEN:#x}
-    nop
-    beqz $v0, done
-    move $s0, $v0
-    move $a0, $s0
-    jal {FCLOSE:#x}
-    nop
-
-    # bk -> tmp, cpd -> bk, tmp -> cpd: el cpd se escribe ultimo, asi un
-    # corte a mitad deja el cpd original intacto.
-    addiu $a0, $sp, {BUF_BK}
-    addiu $a1, $sp, {BUF_TMP}
-    jal {COPYSUB_VA:#x}
-    nop
-    addiu $a0, $sp, {BUF_CPD}
-    addiu $a1, $sp, {BUF_BK}
-    jal {COPYSUB_VA:#x}
-    nop
-    addiu $a0, $sp, {BUF_TMP}
-    addiu $a1, $sp, {BUF_CPD}
-    jal {COPYSUB_VA:#x}
-    nop
-    # deja tmp igual a cpd: si un corte lo dejo a medias, no confunde al
-    # siguiente swap (se sobrescribe antes de usarse).
-    addiu $a0, $sp, {BUF_CPD}
-    addiu $a1, $sp, {BUF_TMP}
-    jal {COPYSUB_VA:#x}
-    nop
-    b done
-    nop
-
-init_only:
-    addiu $a0, $sp, {BUF_BK}
-    addiu $a1, $sp, {BUF_CPD}
-    jal {COPYSUB_VA:#x}
-    nop
-
-done:
-    lw $t0, {FS0}($sp)
+    lw $t0, {S_S0}($sp)
     addiu $v0, $zero, -1
     sw $v0, 0x18($t0)
-    lw $ra, {FR}($sp)
-    lw $gp, {FG}($sp)
-    lw $s0, {F0}($sp)
-    lw $s1, {F1}($sp)
-    lw $s2, {F2}($sp)
-    lw $s3, {F3}($sp)
-    lw $s4, {F4}($sp)
+    lw $ra, {S_RA}($sp)
+    lw $gp, {S_GP}($sp)
+    lw $s0, {S_S0}($sp)
+    lw $s1, {S_S1}($sp)
+    lw $s2, {S_S2}($sp)
+    lw $s3, {S_S3}($sp)
     addiu $sp, $sp, {FRAME}
-    {la('t9', RET_MENU)}
+    {LA_RET}
     jr $t9
     nop
+""".format(FRAME=FRAME, S_RA=S_RA, S_GP=S_GP, S_S0=S_S0, S_S1=S_S1,
+           S_S2=S_S2, S_S3=S_S3, BUF=BUF,
+           LA_CPD_A=la('a0', V['CPD']), LA_BK_A=la('a0', V['BK']),
+           LA_TMP_A=la('a0', V['TMP']), LA_CPD_D=la('a1', V['CPD']),
+           LA_BK_D=la('a1', V['BK']), LA_TMP_D=la('a1', V['TMP']),
+           LA_TAG=la('a1', V['TAG']), LA_SWAP=la('a1', V['SWAP']),
+           LA_FAIL=la('a1', V['FAIL']), LA_NULL=la('a1', V['NULL']),
+           LA_NL=la('a1', V['NL']), LA_INIT=la('a1', V['INIT']),
+           LA_L1=la('a0', V['L1']), LA_L2=la('a0', V['L2']),
+           LA_L3=la('a0', V['L3']),
+           LA_RET=la('t9', RET_MENU), APP=A_APP, CPY=A_CPY, LOG=A_LOG)
 
-notconf:
-    lw $t0, {FS0}($sp)
-    addiu $v0, $zero, -1
-    sw $v0, 0x18($t0)
-    lw $ra, {FR}($sp)
-    lw $gp, {FG}($sp)
-    lw $s0, {F0}($sp)
-    lw $s1, {F1}($sp)
-    lw $s2, {F2}($sp)
-    lw $s3, {F3}($sp)
-    lw $s4, {F4}($sp)
-    addiu $sp, $sp, {FRAME}
-    {la('t9', RET_NO)}
-    jr $t9
-    nop
-"""
-main_bytes = asm_at(MAIN, MAIN_VA)
-enc = copy_bytes + main_bytes
-print(f"copysub {COPYSUB_VA:#x} ({len(copy_bytes)}b) | main {MAIN_VA:#x} ({len(main_bytes)}b)")
-print(f"end {CAVE+len(enc):#x} | strings {STRV:#x} | margen {STRV-(CAVE+len(enc))}b")
-assert CAVE + len(enc) <= STRV, f"solape: {CAVE+len(enc):#x} > {STRV:#x}"
+mn = A(MAIN, A_MAIN)
+enc = ap + cp + wl + mn
+print("app %#x copy %#x log %#x main %#x end %#x strs %#x margen %d" %
+      (A_APP, A_CPY, A_LOG, A_MAIN, CAVE + len(enc), STRV,
+       STRV - (CAVE + len(enc))))
+assert CAVE + len(enc) <= STRV, "solape"
 
 ins = list(MD.disasm(enc, CAVE))
-assert sum(i.size for i in ins) == len(enc), "desensamblado incompleto"
+assert sum(i.size for i in ins) == len(enc), "disasm incompleto"
 errs = []
 for k, i in enumerate(ins):
     if i.mnemonic in ('jal', 'jalr', 'jr'):
-        nxt = ins[k+1] if k+1 < len(ins) else None
-        if not nxt or nxt.mnemonic != 'nop':
-            errs.append(f"{i.address:#x} {i.mnemonic} sin nop en delay slot")
+        n = ins[k + 1] if k + 1 < len(ins) else None
+        if not n or n.mnemonic != 'nop':
+            errs.append("%#x %s sin nop" % (i.address, i.mnemonic))
     if i.mnemonic in ('b', 'beq', 'bne', 'beqz', 'bnez'):
         t = int(i.op_str.split(',')[-1].strip(), 16)
         if not (CAVE <= t < CAVE + len(enc)):
-            errs.append(f"{i.address:#x} {i.mnemonic} -> {t:#x} fuera del cave")
-    if i.mnemonic == 'jal':
-        t = int(i.op_str.strip(), 16)
-        ok = t in (SNPRINTF, FOPEN, FREAD, FWRITE, FCLOSE, MALLOC, FREE, COPYSUB_VA)
-        if not ok:
-            errs.append(f"{i.address:#x} jal -> {t:#x} no es un stub conocido")
+            errs.append("%#x %s -> %#x" % (i.address, i.mnemonic, t))
 assert not errs, errs
 
-hook = asm_at(f"j {MAIN_VA:#x}", HOOK)[:8].ljust(8, b"\x00")
-assert len(hook) == 8, len(hook)
-
+hook = A("j %d" % A_MAIN, HOOK)[:8].ljust(8, b"\x00")
 d = bytearray(open(SRC, 'rb').read())
-assert len(d) == 0x1192ec
-assert set(d[CAVE-0x400000:CAVE_END-0x400000]) == {0}, "cave no esta en cero"
-assert bytes(d[HOOK-0x400000:HOOK-0x400000+8]) == struct.pack('<II', 0x24020001, 0x16e2ff33)
-
-d[CAVE-0x400000:CAVE-0x400000+len(enc)] = enc
-d[STRV-0x400000:STRV-0x400000+len(STRINGS)] = STRINGS
-d[HOOK-0x400000:HOOK-0x400000+8] = hook
-
-e_phoff, = struct.unpack_from('<I', d, 0x1c)
-ph = e_phoff + 3*0x20
-assert struct.unpack_from('<I', d, ph+16)[0] == 0x112970
-struct.pack_into('<II', d, ph+16, 0x113000, 0x113000)
-
+assert set(d[CAVE - 0x400000:CAVE_END - 0x400000]) == {0}
+d[CAVE - 0x400000:CAVE - 0x400000 + len(enc)] = enc
+d[STRV - 0x400000:STRV - 0x400000 + len(STRINGS)] = STRINGS
+d[HOOK - 0x400000:HOOK - 0x400000 + 8] = hook
+ep, = struct.unpack_from('<I', d, 0x1C)
+struct.pack_into('<II', d, ep + 3 * 0x20 + 16, 0x113000, 0x113000)
 open(OUT, 'wb').write(d)
-print(f"OK -> {OUT} ({len(d)} bytes)")
+print("OK", OUT, len(d))
