@@ -46,14 +46,62 @@ cubegm/cores/.pcsx4all/pcsx4all.cfg
 | `SpuVolume` | volumen | `0`-`1024` |
 | `CycleMultiplier` | ciclos por instruccion, **en hex** | `050`=0.31x a `300`=3.00x, `200`=2.00x |
 | `interlace` | fuerza salteo de lineas | `0` normal, `1` saltea impares |
-| `clip_368` | recorte horizontal, **parche propio de Segam** | `0`/`1` |
+| `clip_368` | recorte horizontal en modo 368 (ver abajo) | `0`/`1` |
 | `lighting` | iluminacion | `0`/`1` |
 | `fast_lighting` | iluminacion rapida (menos precisa) | `0`/`1` |
 | `blending` | transparencias | `0`/`1` |
 | `dithering` | tramado | `0`/`1` |
 
-`clip_368` no existe en los forks publicos de pcsx4all: es un parche del firmware
-de Segam. Se deja en `0`.
+### clip_368: que hace exactamente
+
+No es un parametro de pcsx4all original. Es el **`pixel_skip`** de gpu_unai con
+otro nombre, apuntado a la resolucion 368 de PS1.
+
+**Que es 368.** PS1 tiene 8 resoluciones horizontales reales, y 368 es una de
+ellas. La usan bastantes juegos de alta resolucion (Tekken 3, Ridge Racer, menus
+de varios titulos). En el fuente de gpu_unai upstream:
+
+```c
+static const uint32_t HorizontalResolution[8] = { 256, 368, 320, 384, 512, 512, 640, 640 };
+```
+
+**Que hace el flag.** El panel del stick es de 320x240, o sea 320 pixeles de
+ancho. Cuando el juego pide 368, sobran 48 columnas que no entran. La rama
+`case 368` del blit llama a `GPU_BlitWWWWWWWWS(src, dst, isRGB24, 4)`: ese ultimo
+argumento (`uClip_src = 4`) hace que **saltee los primeros 4 pixeles de cada grupo
+de 18 y escriba 16**. Resultado: 20 grupos x 16 = 320 exacto, justo el ancho del
+panel. Las 48 columnas se descartan en la cuenta de punteros, sin llegar a
+escribirse.
+
+**Donde esta en el binario.** El parser guarda el valor en el bit 0 de la
+estructura `gpu_unai_config_t`, la misma posicion que `pixel_skip` en el fuente
+upstream. En el fork publico esa opcion esta comentada (`/* ... */`); Segam la
+volvio a habilitar bajo el nombre `clip_368`.
+
+```
+0x467f30  lui   $a1, 0x50          ; string "clip_368"
+0x467f38  jal   0x5125e0           ; strcmp
+0x4680b8  ins   $v1, $a0, 0, 1     ; escribe bit 0
+...
+0x468e8c  lbu   $v0, 0x7560($v0)   ; lee el byte de config
+0x468ea4  ext   $v0, $v0, 0, 1     ; extrae bit 0
+0x468eb8  sb    $v0, -0x7184($s0)  ; global "pixel skip activo"
+...
+0x46244c  lbu   $t6, -0x7184($v0)  ; dentro de case 368
+0x462450  beqz  $t6, 0x462b14      ; 0 -> ruta sin recorte
+0x462f00  ...                      ; 1 -> ruta con recorte de 4 pixeles
+```
+
+**Consecuencia practica:** solo afecta a juegos que corren a 368 de ancho. En
+juegos a 320 no hace absolutamente nada, y en 512/640 tampoco (esos van por
+`blit_mask`, otro camino).
+
+**Riesgo.** El fuente de gpu_unai advierte que si un juego lee el framebuffer de
+vuelta para hacer efectos, puede notar los pixeles descartados. Es poco comun y
+en el peor caso no cambia nada.
+
+Recomendacion: **`clip_368 1`** si jugas titulos de 368. Si ves algun artefacto
+raro, volve a `0`.
 
 ## Perfil recomendado: `pcsx4all - fluido y calidad.cfg`
 
@@ -77,7 +125,7 @@ Ajustes sobre el de fabrica y por que:
 | `dithering` | 0 | **0** | apagado se ve mas limpio en panel chico |
 | `CycleMultiplier` | 200 | **200** | 2.00x es el equilibrio; subir a `300` da mas compatibilidad y menos FPS |
 | `interlace` | 0 | **0** | el panel es progresivo, no hace falta |
-| `clip_368` | 0 | **0** | sin documentacion, se deja como viene |
+| `clip_368` | 0 | **1** | recorta 368->320 en el blit; menos trabajo y se ve igual |
 
 ### Si un juego puntual va lento
 1. Bajar `CycleMultiplier` a `180` (1.50x). Es lo que mas rinde.
