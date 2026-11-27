@@ -55,3 +55,12 @@ Esto explica por que al apretar L2+R2 (si comparten eje) gana R2.
 ## Estado
 - Pendiente: confirmar con el usuario si L2 y R2 dan el **mismo indice de eje** (type 2) en el test.
   Si el indice es distinto, toda la teoria del eje compartido se cae.
+
+## Archivo generado
+`joystick - TL1-TL2 y TR1-TR2 intercambiados.cpd` (raiz del repo, 339011 bytes).
+Swap aplicado en 6 miembros: `0000_0000`, `0810_0001_0100`, `0810_0001_0110`,
+`0810_0001_0111`, `20bc_5500`, `2563_0555`. Sin tocar `joystick.raw` ni `ui.cfg`.
+Round-trip verificado: extraer del .cpd generado reproduce los 8 miembros byte a byte.
+
+Metodo del swap: sustitucion con marcadores intermedios para evitar doble reemplazo
+(TL1->TL2->TL1). Validado que el numero de campos por linea no cambia.
