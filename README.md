@@ -83,11 +83,41 @@ cpdtool.py fromzip <file.zip> <file.cpd>
 - Integridad del contenedor: OK.
 - Probado en el stick: L2 + R2 simultaneos funcionan.
 
+## Creditos
+
+`cpdtool.py` **no es nuestro**. Lo trajo Emilio y lo escribio un tercero que no
+pudimos identificar: el archivo no trae autor, licencia ni URL, y el commit que
+lo subio a este repo es un "Add files via upload" sin atribucion.
+
+Si sos el autor de esa herramienta, escribinos y te ponemos el credito con
+nombre y link como corresponde. Tu trabajo fue el que hizo posible todo esto:
+sin una herramienta para abrir y rearmar el `.cpd` no se podia ni empezar.
+
+### Creditos verificables
+
+El formato que usa `cpdtool.py` (ZIP con firmas `PK\x03\x04`/`PK\x01\x02`/`PK\x05\x06`
+sustituidas por `WQW\x03`/`WQW\x02`/`WQW\x01` y nombres de miembro con XOR) esta
+documentado publicamente en:
+
+- **ethersloth** — [`GameMT_E5_One_Click_Tool`](https://github.com/ethersloth/GameMT_E5_One_Click_Tool):
+  `Codes/wqw_writer.py` y `wqw2zip.py` documentan el mismo esquema de firmas y el
+  XOR de nombres. Comprobamos que aplica exacto a nuestro `joystick.cpd`.
+- **matiasm2** — [`super-drive-mini-2-sd-backup`](https://github.com/matiasm2/super-drive-mini-2-sd-backup)
+  y **jeborgesm** — [`xgo-a10-research`](https://github.com/jeborgesm/xgo-a10-research):
+  documentan el mismo contenedor `WQW` en otros equipos con el mismo SoC.
+
+Gracias a ellos por publicar el formato en vez de dejarlo cerrado.
+
+### Lo nuestro
+
+El analisis del binario `rkgame`, el diagnostico de `TL1`/`TR1` vs `TL2`/`TR2`
+y la solucion de los gatillos son de este repo (ver `AGENTS.md`).
+
 ## Archivos
 
 ```
 joystick - TL1-TL2 y TR1-TR2 intercambiados.cpd   el archivo para instalar
-cpdtool.py                                        herramienta .cpd
+cpdtool.py                                        herramienta .cpd (de terceros)
 cubegm.zip                                        firmware original de referencia
 AGENTS.md                                         notas de ingenieria inversa
 ```
